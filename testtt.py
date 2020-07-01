@@ -2,7 +2,7 @@ import torch
 from PIL import Image
 from torch import nn
 import numpy as np
-from matplotlib import pyplot as plt
+from torchvision.transforms import transforms
 
 
 class ResidualBlock(nn.Module):
@@ -61,14 +61,6 @@ class CycleGenerator(nn.Module):
     def forward(self, x):
         return self.model(x)
 
-def create_model(d_conv_dim=3, n_res_blocks=6):
-
-    G_XtoY = CycleGenerator(conv_dim=d_conv_dim, n_res_blocks=n_res_blocks)     # Генератор из лета в зиму
-   # G_YtoX = CycleGenerator(conv_dim=d_conv_dim, n_res_blocks=n_res_blocks)     # Генератор из зимы в лето
-    G_XtoY.load_state_dict(torch.load("C:/Users/Trali/Desktop/pop/G_XtoY.pkl"), False)
- #   G_YtoX.load_state_dict(torch.load("G_XtoY.pkl"), False)
-
-    return G_XtoY #, G_YtoX
 
 def scale(x, feature_range=(-1, 1)):                                            # Маштабируем изображение в пределах (-1,1) вместо (0,1)
     min, max = feature_range
@@ -84,26 +76,6 @@ def to_data(x):                                                                 
 
 def get_img(path):
   img = Image.open(path)
+  img = transforms.Resize(256, Image.BICUBIC)(img)
   img = torch.tensor(np.array(img).transpose((2, 0, 1)), dtype=torch.float)
   return img
-
-
-G_XtoY = create_model()
-
-fixed_X = get_img("C:/Users/Trali/Desktop/pop/testb/testb/2011-08-29_17_50_50.jpg")[None, ...].cpu()
-#plt.imshow(to_data(fixed_X))
-
-fixed_X = scale(fixed_X)
-#fixed_Y = scale(fixed_Y)
-
-#fake_Y = G_YtoX(fixed_Y)
-fixed_X = fixed_X.to('cpu')          # ЭТО Я ВСЕ ОСТАВЛЯЮ ЧТОБЫ ОРИЕТИРОВАТЬСЯ В ФУНКЦИЯХ, ПОТОМ УБЕРУ
-fake_X = G_XtoY(fixed_X)
-
-fake_X = to_data(fake_X)
-fixed_X = to_data(fixed_X)
-#fixed_Y = to_data(fixed_Y)
-plt.imshow(fake_X)
-plt.show()
-plt.imshow(fixed_X)
-plt.show()
