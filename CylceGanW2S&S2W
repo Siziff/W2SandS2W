@@ -1,0 +1,390 @@
+import torch
+from torch import nn
+import numpy as np
+import PIL
+from PIL import Image
+import copy
+from torchvision import transforms, models
+from matplotlib import pyplot as plt
+import itertools
+import os
+import torchvision
+from torch.utils.data import Dataset, DataLoader
+from torch.nn import functional as F
+from IPython.display import clear_output
+import warnings
+from pytest import set_trace
+
+%matplotlib inline
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!mkdir samples_cyclegan
+!mkdir sample_data
+!mkdir checkpoints_cyclegan
+
+def Data_Train(image_type, image_dir, image_size=172, batch_size=16, num_workers=8 ):
+  transform = transforms.Compose([transforms.Resize(image_size), transforms.ToTensor()]) 
+  dataset = torchvision.datasets.ImageFolder(root=image_dir, transform=transform)
+  train_loader = DataLoader( dataset=dataset, batch_size= batch_size, shuffle=True, num_workers=num_workers)
+  return train_loader
+
+def Data_Test(image_type, image_dir, image_size=172, batch_size=16, num_workers=8 ):
+  transform = transforms.Compose([transforms.Resize(image_size), transforms.ToTensor()]) 
+  dataset = torchvision.datasets.ImageFolder(root=image_dir, transform=transform)
+  test_loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+  return test_loader
+
+dataloader_X = Data_Train(image_dir = '/content/drive/My Drive/sum2win/trainA', image_type='summer')
+test_dataloader_X = Data_Test(image_dir='/content/drive/My Drive/sum2win/testB', image_type='summer')
+dataloader_Y = Data_Train(image_dir = '/content/drive/My Drive/sum2win/trainB', image_type='winter')
+test_dataloader_Y = Data_Test(image_dir='/content/drive/My Drive/sum2win/testA', image_type='winter')
+
+ class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super(ResidualBlock, self).__init__()
+
+        conv_block = [  nn.ReflectionPad2d(1),                                  # Отзеркаливаем изображения по сторонам для необходимого размера изображения
+                        nn.Conv2d(in_features, in_features, 3), 
+                        nn.InstanceNorm2d(in_features),                         # Нормализация чутьчуть покруче чем LayerNorm
+                        nn.ReLU(inplace=True),
+                        nn.ReflectionPad2d(1),
+                        nn.Conv2d(in_features, in_features, 3),
+                        nn.InstanceNorm2d(in_features)  ]
+
+        self.conv_block = nn.Sequential(*conv_block)
+
+    def forward(self, x):
+        return x + self.conv_block(x)
+
+class CycleGenerator(nn.Module):
+    def __init__(self, conv_dim, output_nc = 3, n_res_blocks =9):
+        super(CycleGenerator, self).__init__()
+     
+        model = [   nn.ReflectionPad2d(3),                                      # Начальный блок свертки
+                    nn.Conv2d(conv_dim, 64, 7),
+                    nn.InstanceNorm2d(64),
+                    nn.ReLU(inplace=True) ]
+
+        in_features = 64                                                        # Свертка
+        out_features = in_features*2
+        for _ in range(2):
+            model += [  nn.Conv2d(in_features, out_features, 3, stride=2, padding=1),
+                        nn.InstanceNorm2d(out_features),
+                        nn.ReLU(inplace=True) ]
+            in_features = out_features
+            out_features = in_features*2
+
+        for _ in range(n_res_blocks ):                                          # Residual blocks
+            model += [ResidualBlock(in_features)]
+
+        out_features = in_features//2                                           # Развертка
+        for _ in range(2):
+            model += [  nn.ConvTranspose2d(in_features, out_features, 3, stride=2, padding=1, output_padding=1),
+                        nn.InstanceNorm2d(out_features),
+                        nn.ReLU(inplace=True) ]
+            in_features = out_features
+            out_features = in_features//2
+
+        model += [  nn.ReflectionPad2d(3),                                      # Выходные слои
+                    nn.Conv2d(64, output_nc, 7),
+                    nn.Tanh() ]
+
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        return self.model(x)
+
+class Discriminator(nn.Module):
+    def __init__(self, conv_dim):
+        super(Discriminator, self).__init__()
+
+        model = [   nn.Conv2d(conv_dim, 64, 4, stride=2, padding=1),            # Поробую LeakyReLU Вместо ReLU
+                    nn.LeakyReLU(0.2, inplace=True) ]
+
+        model += [  nn.Conv2d(64, 128, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(128), 
+                    nn.LeakyReLU(0.2, inplace=True) ]
+
+        model += [  nn.Conv2d(128, 256, 4, stride=2, padding=1),
+                    nn.InstanceNorm2d(256), 
+                    nn.LeakyReLU(0.2, inplace=True) ]
+
+        model += [  nn.Conv2d(256, 512, 4, padding=1),
+                    nn.InstanceNorm2d(512), 
+                    nn.LeakyReLU(0.2, inplace=True) ]
+
+        model += [nn.Conv2d(512, 1, 4, padding=1)]
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        x =  self.model(x)
+        return F.avg_pool2d(x, x.size()[2:]).view(x.size()[0], -1)              # Усредняем и "Сплющиваем"
+        
+def imshow(img):
+    npimg = img.numpy()
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    
+dataiter = iter(dataloader_X)                                                   # Посмотрим на лето
+images, _ = dataiter.next()
+fig = plt.figure(figsize=(12, 8))
+imshow(torchvision.utils.make_grid(images))
+
+dataiter = iter(dataloader_Y)                                                   # Посмотрим на зиму
+images, _ = dataiter.next()
+fig = plt.figure(figsize=(12,8))
+imshow(torchvision.utils.make_grid(images))
+
+def scale(x, feature_range=(-1, 1)):                                            # Маштабируем изображение в пределах (-1,1) вместо (0,1)
+    min, max = feature_range
+    x = x * (max - min) + min
+    return x
+
+def create_model(g_conv_dim=3, d_conv_dim=3, n_res_blocks=6):
+
+    G_XtoY = CycleGenerator(conv_dim=d_conv_dim, n_res_blocks=n_res_blocks)     # Генератор из лета в зиму
+    G_YtoX = CycleGenerator(conv_dim=d_conv_dim, n_res_blocks=n_res_blocks)     # Генератор из зимы в лето
+
+    D_X = Discriminator(conv_dim=d_conv_dim)                                    # Дискриминатор для лета в зиму
+    D_Y = Discriminator(conv_dim=d_conv_dim)                                    # Дискриминатор для зимы в лето
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        G_XtoY.to(device)
+        G_YtoX.to(device)
+        D_X.to(device)
+        D_Y.to(device)
+        print('Models moved to GPU.')
+    else:
+        print('Only CPU available.')
+
+    return G_XtoY, G_YtoX, D_X, D_Y
+
+G_XtoY, G_YtoX, D_X, D_Y = create_model()
+
+def print_models(G_XtoY, G_YtoX, D_X, D_Y):                                     # Посмотрим на всякий случай как выгледят наши модели по слоям
+    print("            Генератор из лета в зиму           ")
+    print("-----------------------------------------------")
+    print(G_XtoY)
+    print()
+
+    print("            Генератор из зимы в лето           ")
+    print("-----------------------------------------------")
+    print(G_YtoX)
+    print()
+
+    print("          Дискриминатор для лета в зиму        ")
+    print("-----------------------------------------------")
+    print(D_X)
+    print()
+
+    print("        Дискриминатор для зимы в лето          ")
+    print("-----------------------------------------------")
+    print(D_Y)
+    print()
+print_models(G_XtoY, G_YtoX, D_X, D_Y)
+
+def real_mse_loss(D_out):                                                       # На сколько полученная картинка похожа с реальной
+    return torch.mean((D_out-1)**2)
+    
+def fake_mse_loss(D_out):                                                       # На сколько полученая картинка похожа на фейк
+    return torch.mean(D_out**2)
+    
+def cycle_consistency_loss(real_im, reconstructed_im, lambda_weight):            
+    reconstruction_loss = torch.mean(torch.abs(real_im - reconstructed_im))     # Расчет потери при трансформации 
+    return lambda_weight * reconstruction_loss
+    
+import torch.optim as optim
+lr=0.00001
+
+beta1=0.5
+beta2=0.999 
+
+g_params = list(G_XtoY.parameters()) + list(G_YtoX.parameters())
+
+g_optimizer = optim.Adam(g_params, lr, [beta1, beta2])
+d_x_optimizer = optim.Adam(D_X.parameters(), lr, [beta1, beta2])                # АДАМ ТУТ!
+d_y_optimizer = optim.Adam(D_Y.parameters(), lr, [beta1, beta2])
+
+import imageio                                                                  # Функцию удалили из библиотеки, импортим отдельно
+def checkpoint(iteration, G_XtoY, G_YtoX, D_X, D_Y, checkpoint_dir='checkpoints_cyclegan'): # Сохранение результатов обучения
+
+    G_XtoY_path = os.path.join(checkpoint_dir, 'G_XtoY.pth')
+    G_YtoX_path = os.path.join(checkpoint_dir, 'G_YtoX.pth')
+    D_X_path = os.path.join(checkpoint_dir, 'D_X.pth')
+    D_Y_path = os.path.join(checkpoint_dir, 'D_Y.pth')
+    torch.save(G_XtoY.state_dict(), G_XtoY_path)
+    torch.save(G_YtoX.state_dict(), G_YtoX_path)
+    torch.save(D_X.state_dict(), D_X_path)
+    torch.save(D_Y.state_dict(), D_Y_path)
+
+def save_samples(iteration, fixed_Y, fixed_X, G_YtoX, G_XtoY, batch_size=16, sample_dir='samples_cyclegan'):
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")     # Перемещение входных данных на нужное устройство
+
+    fake_X = G_YtoX(fixed_Y.to(device))
+    fake_Y = G_XtoY(fixed_X.to(device))
+    
+    X, fake_X = to_data(fixed_X), to_data(fake_X)
+    Y, fake_Y = to_data(fixed_Y), to_data(fake_Y)
+    
+    merged = merge_images(X, fake_Y, batch_size).astype(np.uint8)
+    path = os.path.join(sample_dir, 'sample-{:06d}-X-Y.png'.format(iteration))
+    #set_trace()
+    imageio.imsave(path, merged)
+    #set_trace()
+    Figure= plt.figure(figsize=(16,4))
+    
+    Figure.add_subplot(2,1,1) 
+
+    plt.imshow(merged[:128,...])                                          
+    plt.axis('off')
+    #print('Saved {}'.format(path))                                              # Посмотрим на лето
+    
+    merged = merge_images(Y, fake_X, batch_size).astype(np.uint8)
+    path = os.path.join(sample_dir, 'sample-{:06d}-Y-X.png'.format(iteration))
+    #set_trace()
+    imageio.imsave(path, merged)
+    Figure.add_subplot(2,1,2) 
+    plt.imshow(merged[:128,...]) 
+    plt.axis('off')
+    plt.show()
+   # print('Saved {}'.format(path))
+
+def to_data(x):                                                                 # Переводит переменные в numpy
+    if torch.cuda.is_available():
+        x = x.cpu()
+    x = x.data.numpy()
+    x = ((x +1)*255 / (2)).astype(np.uint8)                                     # rescale to 0-255
+    return x  
+
+def merge_images(sources, targets, batch_size=16):
+    """Creates a grid consisting of pairs of columns, where the first column in
+        each pair contains images source images and the second column in each pair
+        contains images generated by the CycleGAN from the corresponding images in
+        the first column.
+        """
+    _, _, h, w = sources.shape
+    row = int(np.sqrt(batch_size))
+    merged = np.zeros([3, row*h, row*w*2])
+    for idx, (s, t) in enumerate(zip(sources, targets)):
+        i = idx // row
+        j = idx % row
+        merged[:, i*h:(i+1)*h, (j*2)*h:(j*2+1)*h] = s
+        merged[:, i*h:(i+1)*h, (j*2+1)*h:(j*2+2)*h] = t
+    merged = merged.transpose(1, 2, 0)
+    return merged
+
+def train(dataloader_X, dataloader_Y, test_dataloader_X, test_dataloader_Y, 
+                  n_epochs=1000):  
+    print_every=10
+       
+    losses = []
+
+    test_iter_X = iter(test_dataloader_X)
+    test_iter_Y = iter(test_dataloader_Y)
+
+    fixed_X = test_iter_X.next()[0]                                             # Фиксируем Пару картинок Зимы и Лета чтобы сравнивать с тем что ВРОДЕ должно получаться
+    fixed_Y = test_iter_Y.next()[0]
+    fixed_X = scale(fixed_X)
+    fixed_Y = scale(fixed_Y)
+
+    iter_X = iter(dataloader_X)                                                 # batches per epoch
+    iter_Y = iter(dataloader_Y)
+    batches_per_epoch = min(len(iter_X), len(iter_Y))
+
+    for epoch in range(1, n_epochs+1):
+
+        if epoch % batches_per_epoch == 0:                                      # Обновление интератора перед кадой эпохой
+            iter_X = iter(dataloader_X)
+            iter_Y = iter(dataloader_Y)
+
+        images_X, _ = iter_X.next()
+        images_X = scale(images_X)                                              # На всякий случай проверяем что масштаб от -1 до 1
+
+        images_Y, _ = iter_Y.next()
+        images_Y = scale(images_Y)
+        
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        images_X = images_X.to(device)
+        images_Y = images_Y.to(device)
+
+        d_x_optimizer.zero_grad()                                               # ТУТ НАЧАЛО ТРЕНИРОВКИ ДИСКРИМИНАТОРА
+
+        out_x = D_X(images_X)                                                   # Посчитаем лосс дискриминатора на реальной картинке 
+        d_x_real_loss = real_mse_loss(out_x)                                    
+        
+        fake_img_x = G_YtoX(images_Y)                                           # Сделаем фейковую картинку Х на основе У
+        
+        out_x = D_X(fake_img_x)                                                 # Посчитаем лосс дискриминатора на фейковой картинке 
+        d_x_fake_loss = fake_mse_loss(out_x)
+        
+        d_x_loss = d_x_real_loss + d_x_fake_loss                                # Суммируем лоссы
+        d_x_loss.backward()
+        d_x_optimizer.step()
+
+        d_y_optimizer.zero_grad()                                               # Повторим то же самое с другим дикриминатором (в другую сторону)
+        
+        out_y = D_Y(images_Y)
+        d_y_real_loss = real_mse_loss(out_y)
+        
+        fake_img_y = G_XtoY(images_X)
+        out_y = D_Y(fake_img_y)
+        d_y_fake_loss = fake_mse_loss(out_y)
+        
+        d_y_loss = d_y_real_loss + d_y_fake_loss
+        
+        d_y_loss.backward()
+        d_y_optimizer.step()
+
+        g_optimizer.zero_grad()                                                 # НАЧАЛО ТРЕНИРОВКИ ГЕНЕРАТОРА
+
+        fake_x_img = G_YtoX(images_Y)                                           # Создание изображения лета на основе зимы
+
+        out_x = D_X(fake_x_img)                                                 # Считаем лосс генератора лета
+        g_ytox_loss = real_mse_loss(out_x)                                      # Проверка полученных картинок по сравнению с настоящими 
+
+        y_hat = G_XtoY(fake_x_img)                                              # Делаем обратно из лета зиму
+                
+        g_ytox_cycle_loss = cycle_consistency_loss(images_Y, y_hat, lambda_weight=10) # Считаем лосс после прохождении картинки по кругу
+
+        fake_y_img = G_XtoY(images_X)                                           # Делаем все то же самое только с с картинкой которая шла по другому кругу
+        out_y = D_Y(fake_y_img)
+        g_xtoy_loss = real_mse_loss(out_y)
+        
+        x_hat = G_YtoX(fake_y_img)
+        g_xtoy_cycle_loss = cycle_consistency_loss(images_X, x_hat, lambda_weight=10)
+
+        g_total_loss = g_ytox_loss + g_ytox_cycle_loss + g_xtoy_loss + g_xtoy_cycle_loss # Складываем все получившиеся лоссы и делаем обратное распространение ошибки 
+        g_total_loss.backward()
+        g_optimizer.step()
+ 
+        if epoch % print_every == 0:                                            # Смотрим на то что получилось по лоссам 
+            losses.append((d_x_loss.item(), d_y_loss.item(), g_total_loss.item()))
+            print('Epoch [{:5d}/{:5d}] | d_X_loss: {:6.4f} | d_Y_loss: {:6.4f} | g_total_loss: {:6.4f}'.format(
+                    epoch, n_epochs, d_x_loss.item(), d_y_loss.item(), g_total_loss.item()))
+
+            
+        sample_every=10
+        if epoch % sample_every == 0:                                           # Сохраняем результаты генератора
+            G_YtoX.eval() 
+            G_XtoY.eval()
+            save_samples(epoch, fixed_Y, fixed_X, G_YtoX, G_XtoY, batch_size=16)
+            G_YtoX.train()
+            G_XtoY.train()
+
+
+        checkpoint_every=100
+
+        if epoch % checkpoint_every == 0:                                       # Сохраняем параметры модели
+            checkpoint(epoch, G_XtoY, G_YtoX, D_X, D_Y)
+            #torch.save(the_model.state_dict(), '/content/drive/My Drive/content')
+
+    return losses
+    
+n_epochs = 4000
+
+losses = train(dataloader_X, dataloader_Y, test_dataloader_X, test_dataloader_Y, n_epochs=n_epochs)
+
+
